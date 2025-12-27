@@ -5,7 +5,7 @@ VM_DIR="$HOME/vms"
 mkdir -p "$VM_DIR"
 
 # ==============================
-# OS LỰA CHỌN KHI TẠO VPS
+# DANH SÁCH HỆ ĐIỀU HÀNH
 # ==============================
 declare -A OS_LIST=(
 ["1"]="Ubuntu 22.04|https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"
@@ -19,13 +19,12 @@ declare -A OS_LIST=(
 select_os() {
 echo "===== CHỌN HỆ ĐIỀU HÀNH ====="
 for key in "${!OS_LIST[@]}"; do
-    name=$(echo "${OS_LIST[$key]}" | cut -d "|" -f 1)
-    echo "$key) $name"
+    echo "$key) $(echo ${OS_LIST[$key]} | cut -d '|' -f1)"
 done
-read -p "Chọn OS: " OS_CHOICE
+read -p "Chọn: " OS_CHOICE
 [[ -z "${OS_LIST[$OS_CHOICE]+x}" ]] && echo "❌ Sai lựa chọn!" && sleep 1 && select_os
-OS_NAME=$(echo "${OS_LIST[$OS_CHOICE]}" | cut -d "|" -f 1)
-IMG_URL=$(echo "${OS_LIST[$OS_CHOICE]}" | cut -d "|" -f 2)
+OS_NAME=$(echo "${OS_LIST[$OS_CHOICE]}" | cut -d '|' -f1)
+IMG_URL=$(echo "${OS_LIST[$OS_CHOICE]}" | cut -d '|' -f2)
 }
 
 # ==============================
@@ -37,18 +36,19 @@ select_os
 read -p "Tên VPS: " VM_NAME
 read -p "User (default ubuntu): " USERNAME; USERNAME="${USERNAME:-ubuntu}"
 read -s -p "Password (default ubuntu): " PASSWORD; PASSWORD="${PASSWORD:-ubuntu}"; echo
-read -p "RAM (MB) ví dụ 2048: " MEMORY; MEMORY="${MEMORY:-2048}"
-read -p "CPU (tối đa đề xuất 8): " CPUS; CPUS="${CPUS:-2}"
+read -p "RAM (MB - ví dụ: 2048): " MEMORY; MEMORY="${MEMORY:-2048}"
+read -p "CPU (tối đa nên 8): " CPUS; CPUS="${CPUS:-2}"
 read -p "Disk size (VD: 20G): " DISK_SIZE; DISK_SIZE="${DISK_SIZE:-20G}"
 read -p "SSH Port (default 2222): " SSH_PORT; SSH_PORT="${SSH_PORT:-2222}"
 
 IMG_FILE="$VM_DIR/$VM_NAME.img"
 SEED_FILE="$VM_DIR/$VM_NAME-seed.iso"
 
+echo "[+] Đang tải $OS_NAME..."
 wget -q "$IMG_URL" -O "$IMG_FILE"
 qemu-img resize "$IMG_FILE" "$DISK_SIZE"
 
-# LƯU CẤU HÌNH ĐỂ CHẠY SAU KHÔNG HỎI NỮA
+# LƯU CẤU HÌNH ĐỂ CHẠY KHÔNG HỎI LẠI
 cat > "$VM_DIR/$VM_NAME.conf" <<EOF
 VM_NAME="$VM_NAME"
 USERNAME="$USERNAME"
@@ -59,20 +59,21 @@ DISK_SIZE="$DISK_SIZE"
 SSH_PORT="$SSH_PORT"
 EOF
 
-# CLOUD-INIT AUTO LOGIN + AUTO RUN
+# ==============================
+# TẠO AUTO-LOGIN + AUTO DELAY SERVICE
+# ==============================
 cat > user-data <<EOF
 #cloud-config
 hostname: $VM_NAME
 ssh_pwauth: true
 disable_root: false
-
 users:
   - name: $USERNAME
     sudo: ALL=(ALL) NOPASSWD:ALL
     password: $(openssl passwd -6 "$PASSWORD")
     shell: /bin/bash
 
-# Auto login QEMU console
+# AUTO LOGIN TTY S0 (QEMU CONSOLE)
 runcmd:
   - mkdir -p /etc/systemd/system/serial-getty@ttyS0.service.d
   - bash -c 'cat <<EOT >/etc/systemd/system/serial-getty@ttyS0.service.d/override.conf
@@ -83,24 +84,34 @@ EOT'
   - systemctl daemon-reload
   - systemctl restart serial-getty@ttyS0.service
 
-# VNC PASS
-  - mkdir -p /home/$USERNAME/.vnc
-  - echo "12345678" | vncpasswd -f > /home/$USERNAME/.vnc/passwd
-  - chmod 600 /home/$USERNAME/.vnc/passwd
+# AUTO DELAY 15 GIÂY RỒI MỚI CHẠY SCRIPT
+  - bash -c 'cat <<EOT >/etc/systemd/system/autoremote.service
+[Unit]
+Description=Delayed Auto Remote Startup
+After=network-online.target cloud-init.target multi-user.target systemd-user-sessions.service getty.target
 
-# AUTO CHẠY BẢN REMOTE CỦA BẠN
-  - sudo -u $USERNAME bash -c 'bash <(curl -s https://raw.githubusercontent.com/dinhvinhtainopublic/VNC-Remote/refs/heads/main/auto-remote-web.sh)'
+[Service]
+User=$USERNAME
+Type=simple
+ExecStart=/bin/bash -c "sleep 15 && bash <(curl -s https://raw.githubusercontent.com/dinhvinhtainopublic/VNC-Remote/refs/heads/main/auto-remote-web.sh)"
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
+EOT'
+
+  - systemctl enable autoremote.service
 EOF
 
 echo "instance-id: iid-$VM_NAME" > meta-data
 cloud-localds "$SEED_FILE" user-data meta-data
 
-echo "🎉 Đã tạo xong VPS: $VM_NAME"
+echo "🎉 VPS tạo thành công!"
 sleep 1
 }
 
 # ==============================
-# CHẠY VPS - KHÔNG HỎI LẠI CẤU HÌNH
+# CHẠY VPS (KHÔNG HỎI LẠI CẤU HÌNH)
 # ==============================
 start_vm() {
 mapfile -t VM_LIST < <(ls "$VM_DIR" | grep ".conf" | sed 's/.conf//g')
@@ -111,19 +122,14 @@ i=1; for vm in "${VM_LIST[@]}"; do echo "$i) $vm"; ((i++)); done
 read -p "Chọn VPS: " PICK
 VM_NAME="${VM_LIST[$((PICK-1))]}"
 
-# NẠP CẤU HÌNH ĐÃ LƯU
 source "$VM_DIR/$VM_NAME.conf"
 
-# TỰ NHẢY PORT NẾU BẬN, KHÔNG HỎI
+# AUTO NHẢY PORT NẾU TRÙNG
 if ss -tulpn 2>/dev/null | grep -q ":$SSH_PORT "; then
     while ss -tulpn 2>/dev/null | grep -q ":$SSH_PORT "; do SSH_PORT=$((SSH_PORT+1)); done
 fi
 
-echo "[+] Booting $VM_NAME với cấu hình:"
-echo "RAM: $MEMORY MB | CPU: $CPUS | PORT: $SSH_PORT"
-
-IMG_FILE="$VM_DIR/$VM_NAME.img"
-SEED_FILE="$VM_DIR/$VM_NAME-seed.iso"
+echo "[+] Booting $VM_NAME (RAM $MEMORY | CPU $CPUS | PORT $SSH_PORT)"
 
 qemu-system-x86_64 \
 -enable-kvm \
@@ -131,27 +137,29 @@ qemu-system-x86_64 \
 -smp "$CPUS" \
 -serial mon:stdio -nographic \
 -cpu host \
--drive file="$IMG_FILE",format=qcow2,if=virtio \
--drive file="$SEED_FILE",format=raw,if=virtio \
+-drive "file=$VM_DIR/$VM_NAME.img,format=qcow2,if=virtio" \
+-drive "file=$VM_DIR/$VM_NAME-seed.iso,format=raw,if=virtio" \
 -netdev user,id=n1,hostfwd=tcp::$SSH_PORT-:22 \
 -device e1000,netdev=n1 &
 
-sleep 3
-echo "🌍 Tạo Cloudflare Remote..."
+sleep 6
+echo "🌍 Đang tạo Cloudflare Tunnel..."
 url=$(cloudflared tunnel --url http://localhost:6080 2>&1 | grep -o "https://.*trycloudflare.com")
-echo "➡️  $url"
-echo "====================================="
+echo "==============================="
+echo "➡️  LINK REMOTE:"
+echo "👉 $url"
+echo "==============================="
 read -p "Enter để quay lại menu..."
 }
 
 # ==============================
-# MAIN MENU - LOOP
+# MENU CHÍNH – KHÔNG BAO GIỜ THOÁT
 # ==============================
 while true; do
 clear
-echo "===== MENU QUẢN LÝ VPS QEMU ====="
-echo "1) Tạo VPS"
-echo "2) Chạy VPS (theo cấu hình đã lưu)"
+echo "===== MENU VPS QEMU ====="
+echo "1) Tạo VPS mới"
+echo "2) Chạy VPS (không hỏi lại cấu hình)"
 echo "0) Thoát"
 read -p "Chọn: " M
 case $M in
